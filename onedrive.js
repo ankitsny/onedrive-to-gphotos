@@ -23,7 +23,6 @@ const IMAGE_EXTENSIONS = new Set([
 
 class OneDriveClient {
   constructor() {
-    this.accessToken = null;
     this.msalClient = new PublicClientApplication({
       auth: {
         clientId: process.env.ONEDRIVE_CLIENT_ID,
@@ -49,13 +48,16 @@ class OneDriveClient {
   // ── Auth ──────────────────────────────────────────────────────
 
   async authenticate() {
+    // Just ensures an account is in the MSAL cache.
+    // The actual access token is fetched fresh on every API call via getAccessToken()
+    // so it is always valid — MSAL uses the refresh token automatically when needed.
     const scopes = ['Files.Read', 'offline_access'];
 
     try {
       const accounts = await this.msalClient.getTokenCache().getAllAccounts();
       if (accounts.length > 0) {
-        const result = await this.msalClient.acquireTokenSilent({ scopes, account: accounts[0] });
-        this.accessToken = result.accessToken;
+        // Warm up — verify the cached account still works
+        await this.msalClient.acquireTokenSilent({ scopes, account: accounts[0] });
         logger.success('OneDrive → authenticated via cached token');
         return;
       }
@@ -64,7 +66,7 @@ class OneDriveClient {
       if (fs.existsSync(TOKEN_CACHE)) fs.unlinkSync(TOKEN_CACHE);
     }
 
-    const result = await this.msalClient.acquireTokenByDeviceCode({
+    await this.msalClient.acquireTokenByDeviceCode({
       scopes,
       deviceCodeCallback: async (response) => {
         logger.section('OneDrive Authentication Required');
@@ -87,8 +89,24 @@ class OneDriveClient {
       },
     });
 
-    this.accessToken = result.accessToken;
     logger.success('OneDrive → authenticated successfully');
+  }
+
+  // Get a fresh access token on every call — MSAL handles refresh automatically
+  // This is the correct way to use MSAL: never cache the access token yourself
+  async getAccessToken() {
+    const scopes = ['Files.Read', 'offline_access'];
+    try {
+      const accounts = await this.msalClient.getTokenCache().getAllAccounts();
+      if (accounts.length > 0) {
+        const result = await this.msalClient.acquireTokenSilent({ scopes, account: accounts[0] });
+        return result.accessToken;
+      }
+    } catch (err) {
+      logger.warn(`OneDrive → token refresh failed: ${err.message}`);
+      throw new Error('OneDrive token expired. Delete .onedrive_token.json and re-run.');
+    }
+    throw new Error('No OneDrive account in cache. Delete .onedrive_token.json and re-run.');
   }
 
   // ── Scan all files (paginated) ────────────────────────────────
@@ -148,8 +166,9 @@ class OneDriveClient {
 
   async _get(url) {
     try {
+      const accessToken = await this.getAccessToken();
       const res = await axios.get(url, {
-        headers: { Authorization: `Bearer ${this.accessToken}` },
+        headers: { Authorization: `Bearer ${accessToken}` },
         timeout: 30_000,
       });
       return res.data;
@@ -255,24 +274,39 @@ function createDownloadStream(finalUrl, fileSize, progressState) {
   let received = 0;
   const total = fileSize || 0;
 
-  // Timeout scales with file size: minimum 2 min, +1s per MB, max 6 hours
-  const timeoutMs = Math.min(
-    Math.max(120_000, (total / 1024 / 1024) * 1000),
-    6 * 60 * 60 * 1000
-  );
+  // Inactivity timeout — 60s of silence = stalled connection
+  // Resets on every chunk received, so slow-but-active downloads never time out
+  // No assumption about network speed — only detects truly stuck connections
+  const INACTIVITY_MS = 60_000;
+  let inactivityTimer = null;
+
+  const resetInactivityTimer = () => {
+    if (inactivityTimer) clearTimeout(inactivityTimer);
+    inactivityTimer = setTimeout(() => {
+      r.destroy();
+      pass.destroy(new Error('Download stalled — no data received for 60 seconds'));
+    }, INACTIVITY_MS);
+  };
+
+  const clearInactivityTimer = () => {
+    if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
+  };
 
   const r = https.request({
     hostname: urlObj.hostname,
     path:     urlObj.pathname + urlObj.search,
     method:   'GET',
-    timeout:  timeoutMs,
   }, (res) => {
     if (res.statusCode < 200 || res.statusCode >= 300) {
+      clearInactivityTimer();
       pass.destroy(new Error(`Download failed with HTTP ${res.statusCode}`));
       return;
     }
 
+    resetInactivityTimer(); // start timer when response headers arrive
+
     res.on('data', (chunk) => {
+      resetInactivityTimer(); // reset on every chunk — slow but active = fine
       received += chunk.length;
       if (total && progressState) {
         progressState.dlPct = Math.round((received / total) * 100);
@@ -288,13 +322,8 @@ function createDownloadStream(finalUrl, fileSize, progressState) {
     // Resume CDN download when downstream (upload) drains
     pass.on('drain', () => res.resume());
 
-    res.on('end',   ()    => { pass.end(); });
-    res.on('error', (err) => { process.stdout.write('\n'); pass.destroy(err); });
-  });
-
-  r.on('timeout', () => {
-    r.destroy();
-    pass.destroy(new Error(`Download timed out after ${Math.round(timeoutMs / 60000)} minutes`));
+    res.on('end',   ()    => { clearInactivityTimer(); pass.end(); });
+    res.on('error', (err) => { clearInactivityTimer(); pass.destroy(err); });
   });
 
   // When the stream is destroyed externally (e.g. upload failed),

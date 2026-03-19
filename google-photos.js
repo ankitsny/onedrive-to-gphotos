@@ -135,11 +135,22 @@ class GooglePhotosClient {
 
     logger.debug(`Google Photos → uploading "${filename}" (${totalMB} MB, ${mimeType})`);
 
-    // Timeout scales with file size: minimum 3 min, +2s per MB, max 6 hours
-    const timeoutMs = Math.min(
-      Math.max(180_000, (fileSize / 1024 / 1024) * 2000),
-      6 * 60 * 60 * 1000
-    );
+    // Inactivity timeout — 60s of silence = stalled upload
+    // Resets on every chunk sent, so slow-but-active uploads never time out
+    const INACTIVITY_MS = 60_000;
+    let inactivityTimer = null;
+
+    const resetInactivityTimer = () => {
+      if (inactivityTimer) clearTimeout(inactivityTimer);
+      inactivityTimer = setTimeout(() => {
+        req.destroy();
+        done(new Error('Upload stalled — no data sent for 60 seconds'));
+      }, INACTIVITY_MS);
+    };
+
+    const clearInactivityTimer = () => {
+      if (inactivityTimer) { clearTimeout(inactivityTimer); inactivityTimer = null; }
+    };
 
     // Step 1: Stream bytes directly into Google Photos upload endpoint
     // The download stream and upload request are piped together —
@@ -151,6 +162,7 @@ class GooglePhotosClient {
       const done = (err, val) => {
         if (settled) return;
         settled = true;
+        clearInactivityTimer();
         // Always destroy the stream when we're done — whether success or failure.
         // This aborts the OneDrive CDN connection immediately, freeing the socket.
         if (!stream.destroyed) stream.destroy(err || undefined);
@@ -158,11 +170,11 @@ class GooglePhotosClient {
         else resolve(val);
       };
 
+      resetInactivityTimer(); // start timer when upload begins
       const req = https.request({
         hostname: 'photoslibrary.googleapis.com',
         path:     '/v1/uploads',
         method:   'POST',
-        timeout:  timeoutMs,
         headers: {
           'Authorization':              `Bearer ${accessToken}`,
           'Content-Type':               'application/octet-stream',
@@ -186,10 +198,7 @@ class GooglePhotosClient {
         res.on('error', (err) => { if (progressState) progressState.finish(); else process.stdout.write('\n'); done(err); });
       });
 
-      req.on('timeout', () => {
-        req.destroy();
-        done(new Error(`Upload timed out after ${Math.round(timeoutMs / 60000)} minutes`));
-      });
+      // inactivity timer handles stalls — no fixed req.on('timeout') needed
 
       // Upload req error → destroy stream + reject
       req.on('error', (err) => { if (progressState) progressState.finish(); else process.stdout.write('\n'); done(err); });
@@ -198,6 +207,7 @@ class GooglePhotosClient {
       stream.on('data', (chunk) => {
         const ok = req.write(chunk);
         sent += chunk.length;
+        resetInactivityTimer(); // reset on every chunk — slow but active = fine
 
         if (progressState) {
           progressState.ulPct = Math.round((sent / fileSize) * 100);

@@ -115,11 +115,12 @@ class Database {
   getStats() {
     return this._get(`
       SELECT
-        SUM(CASE WHEN status = 'done'                              THEN 1 ELSE 0 END) as done,
-        SUM(CASE WHEN status = 'failed'                            THEN 1 ELSE 0 END) as failed,
-        SUM(CASE WHEN status IN ('pending','downloading','uploading') THEN 1 ELSE 0 END) as pending
+        SUM(CASE WHEN status = 'done'                                THEN 1 ELSE 0 END) as done,
+        SUM(CASE WHEN status = 'failed'                              THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN status IN ('pending','downloading','uploading') THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'skipped'                             THEN 1 ELSE 0 END) as skipped
       FROM files
-    `) || { done: 0, failed: 0, pending: 0 };
+    `) || { done: 0, failed: 0, pending: 0, skipped: 0 };
   }
 
   // ── Job queue ────────────────────────────────────────────────
@@ -152,14 +153,23 @@ class Database {
     }
   }
 
-  // Fetch next batch of work: pending + previously failed
-  getPendingBatch(limit = 5) {
+  // Fetch next batch of work: pending + failed files that haven't exceeded MAX_RETRIES
+  // Files with retry_count >= maxRetries are excluded — they will be marked 'skipped'
+  getPendingBatch(limit = 5, maxRetries = 3) {
     return this._all(
       `SELECT * FROM files
        WHERE status IN ('pending', 'failed')
+         AND retry_count < ?
        ORDER BY status ASC, id ASC
        LIMIT ?`,
-      [limit]
+      [maxRetries, limit]
+    );
+  }
+
+  markPermSkipped(id, reason) {
+    this._exec(
+      `UPDATE files SET status = 'skipped', error_message = ?, updated_at = datetime('now') WHERE id = ?`,
+      [reason, id]
     );
   }
 
@@ -198,15 +208,34 @@ class Database {
   markFailed(id, stage, error_message) {
     const file = this._get(`SELECT name FROM files WHERE id = ?`, [id]);
 
-    this._exec(
-      `UPDATE files
-       SET status = 'failed',
-           error_message = ?,
-           retry_count = retry_count + 1,
-           updated_at = datetime('now')
-       WHERE id = ?`,
-      [error_message, id]
-    );
+    // Token expiry / auth errors are transient — don't count against retry_count
+    // so files aren't permanently skipped just because the token expired mid-run
+    const isTransient = error_message.includes('token expired')
+                     || error_message.includes('401')
+                     || error_message.includes('stalled');
+
+    if (isTransient) {
+      // Reset to pending — will be retried fresh on next run
+      this._exec(
+        `UPDATE files
+         SET status = 'pending',
+             error_message = ?,
+             updated_at = datetime('now')
+         WHERE id = ?`,
+        [error_message, id]
+      );
+    } else {
+      // Real failure — increment retry_count toward MAX_RETRIES
+      this._exec(
+        `UPDATE files
+         SET status = 'failed',
+             error_message = ?,
+             retry_count = retry_count + 1,
+             updated_at = datetime('now')
+         WHERE id = ?`,
+        [error_message, id]
+      );
+    }
 
     this._exec(
       `INSERT INTO error_logs (file_id, file_name, stage, error) VALUES (?, ?, ?, ?)`,
@@ -215,7 +244,14 @@ class Database {
   }
 
   getErrorLogs() {
-    return this._all(`SELECT * FROM error_logs ORDER BY timestamp DESC LIMIT 50`);
+    // Deduplicate — show only the most recent error per file to avoid noise
+    return this._all(`
+      SELECT file_name, stage, error, MAX(timestamp) as timestamp
+      FROM error_logs
+      GROUP BY file_name, stage
+      ORDER BY timestamp DESC
+      LIMIT 50
+    `);
   }
 }
 
