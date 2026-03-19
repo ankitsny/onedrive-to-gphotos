@@ -193,13 +193,63 @@ function resolveRedirect(url, maxRedirects = 5) {
   });
 }
 
+// ── makeProgressState ─────────────────────────────────────────
+// Shared state between download and upload so both bars render
+// atomically in one write — no two writers racing over the terminal.
+
+// Detect ANSI support — works on macOS, Linux, and Windows Terminal
+// Falls back to single-line mode on classic Windows CMD / old PowerShell
+const SUPPORTS_ANSI = process.platform !== 'win32'
+  || !!process.env.WT_SESSION          // Windows Terminal
+  || process.env.TERM_PROGRAM === 'vscode'
+  || process.env.TERM === 'xterm-256color';
+
+function makeProgressState(fileSize) {
+  const totalMB = (fileSize / 1024 / 1024).toFixed(1);
+  const state = { dlPct: 0, dlMB: '0.0', ulPct: 0, ulMB: '0.0', totalMB };
+
+  const mkBar = (pct) => '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
+
+  let firstRender = true;
+
+  state.render = () => {
+    const dl = `  Downloading: [${mkBar(state.dlPct)}] ${String(state.dlPct).padStart(3)}% — ${state.dlMB}MB / ${state.totalMB}MB`;
+    const ul = `  Uploading:   [${mkBar(state.ulPct)}] ${String(state.ulPct).padStart(3)}% — ${state.ulMB}MB / ${state.totalMB}MB`;
+
+    if (SUPPORTS_ANSI) {
+      if (firstRender) {
+        // No leading \n — the logger already ends its last line with \n
+        // so cursor is already at the start of a fresh line
+        process.stdout.write(dl + '\n' + ul);
+        firstRender = false;
+      } else {
+        // Move up 1 line, overwrite both bars in place
+        process.stdout.write('\x1B[1A\r' + dl + '\n\r' + ul);
+      }
+    } else {
+      // Windows fallback — single overwriting line showing upload progress
+      // Download bar scrolls past on first render only
+      if (firstRender) {
+        process.stdout.write(dl + '\n' + ul);
+        firstRender = false;
+      } else {
+        process.stdout.write('\r' + ul);
+      }
+    }
+  };
+
+  state.finish = () => process.stdout.write('\n');
+
+  return state;
+}
+
 // ── createDownloadStream ──────────────────────────────────────
 // Opens a streaming GET to the final CDN URL.
 // Returns a PassThrough stream — data flows chunk by chunk, never
 // accumulates in RAM. The caller is responsible for destroying
 // the stream on error (call stream.destroy(err)).
 
-function createDownloadStream(finalUrl, fileSize) {
+function createDownloadStream(finalUrl, fileSize, progressState) {
   const pass = new PassThrough();
   const urlObj = new URL(finalUrl);
   let received = 0;
@@ -224,13 +274,10 @@ function createDownloadStream(finalUrl, fileSize) {
 
     res.on('data', (chunk) => {
       received += chunk.length;
-      if (total) {
-        const pct     = Math.round((received / total) * 100);
-        const doneMB  = (received / 1024 / 1024).toFixed(1);
-        const totalMB = (total    / 1024 / 1024).toFixed(1);
-        const filled  = Math.floor(pct / 5);
-        const bar     = '█'.repeat(filled) + '░'.repeat(20 - filled);
-        process.stdout.write(`\r  Downloading: [${bar}] ${pct}% — ${doneMB}MB / ${totalMB}MB`);
+      if (total && progressState) {
+        progressState.dlPct = Math.round((received / total) * 100);
+        progressState.dlMB  = (received / 1024 / 1024).toFixed(1);
+        progressState.render();
       }
 
       // Respect PassThrough backpressure — pause CDN if upload can't keep up
@@ -241,7 +288,7 @@ function createDownloadStream(finalUrl, fileSize) {
     // Resume CDN download when downstream (upload) drains
     pass.on('drain', () => res.resume());
 
-    res.on('end',   ()    => { process.stdout.write('\n'); pass.end(); });
+    res.on('end',   ()    => { pass.end(); });
     res.on('error', (err) => { process.stdout.write('\n'); pass.destroy(err); });
   });
 
@@ -262,4 +309,4 @@ function createDownloadStream(finalUrl, fileSize) {
   return pass;
 }
 
-module.exports = { OneDriveClient, createDownloadStream };
+module.exports = { OneDriveClient, createDownloadStream, makeProgressState };
