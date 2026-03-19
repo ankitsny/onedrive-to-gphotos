@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { OneDriveClient, createDownloadStream } = require('./onedrive');
+const { OneDriveClient, createDownloadStream, makeProgressState } = require('./onedrive');
 const { GooglePhotosClient } = require('./google-photos');
 const { Database } = require('./db');
 const { logger } = require('./logger');
@@ -134,7 +134,10 @@ async function uploadAll(onedrive, gphotos, db) {
         );
 
         // Open stream — data starts flowing immediately
-        stream = createDownloadStream(finalUrl, fileSize);
+        // progressState is shared between download and upload so both bars
+        // render atomically on two dedicated lines without overwriting each other
+        const progressState = makeProgressState(fileSize);
+        stream = createDownloadStream(finalUrl, fileSize, progressState);
 
         db.markUploading(file.id);
         logger.debug(`  → Streaming to Google Photos...`);
@@ -147,7 +150,8 @@ async function uploadAll(onedrive, gphotos, db) {
           file.mime_type,
           fileSize,
           file.modified_date,
-          (id) => db.markUploaded(file.id, id)
+          (id) => db.markUploaded(file.id, id),
+          progressState
         );
 
         // stream is destroyed inside uploadPhoto on success — no cleanup needed here
