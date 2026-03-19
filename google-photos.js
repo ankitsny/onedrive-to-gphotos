@@ -9,7 +9,6 @@ const { logger } = require('./logger');
 
 const TOKEN_FILE = path.join(__dirname, '.google_token.json');
 const ALBUM_NAME = process.env.GOOGLE_ALBUM_NAME || 'From OneDrive';
-const UPLOAD_CHUNK = 256 * 1024; // 256 KB per chunk for progress tracking
 
 class GooglePhotosClient {
   constructor() {
@@ -18,7 +17,7 @@ class GooglePhotosClient {
       process.env.GOOGLE_CLIENT_SECRET,
       'http://localhost:3000/callback'
     );
-    this.albumId = null; // cached after first creation/lookup
+    this.albumId = null;
   }
 
   // ── Auth ──────────────────────────────────────────────────────
@@ -125,27 +124,49 @@ class GooglePhotosClient {
   }
 
   // ── Upload ────────────────────────────────────────────────────
+  // stream     — readable stream from OneDrive (createDownloadStream)
+  // fileSize   — total bytes, required for Content-Length header
+  // onPhotoIdReceived — called immediately when Google confirms the ID,
+  //                     before this function returns, for crash-safe DB write
 
-  async uploadPhoto(buffer, filename, mimeType, modifiedDate, onPhotoIdReceived = null) {
+  async uploadPhoto(stream, filename, mimeType, fileSize, modifiedDate, onPhotoIdReceived = null) {
     const accessToken = (await this.oauth2Client.getAccessToken()).token;
+    const totalMB = (fileSize / 1024 / 1024).toFixed(1);
 
-    logger.debug(`Google Photos → uploading "${filename}" (${(buffer.length / 1024).toFixed(0)} KB, ${mimeType})`);
+    logger.debug(`Google Photos → uploading "${filename}" (${totalMB} MB, ${mimeType})`);
 
-    // Step 1: Upload raw bytes in chunks → shows real progress
-    // axios onUploadProgress fires only once for Buffer payloads (jumps to 100% instantly)
-    // so we use Node's built-in https with manual chunking instead
+    // Timeout scales with file size: minimum 3 min, +2s per MB, max 6 hours
+    const timeoutMs = Math.min(
+      Math.max(180_000, (fileSize / 1024 / 1024) * 2000),
+      6 * 60 * 60 * 1000
+    );
+
+    // Step 1: Stream bytes directly into Google Photos upload endpoint
+    // The download stream and upload request are piped together —
+    // only one chunk (~256KB from CDN) is in memory at any point.
     const uploadToken = await new Promise((resolve, reject) => {
-      const total = buffer.length;
+      let settled = false;
       let sent = 0;
+
+      const done = (err, val) => {
+        if (settled) return;
+        settled = true;
+        // Always destroy the stream when we're done — whether success or failure.
+        // This aborts the OneDrive CDN connection immediately, freeing the socket.
+        if (!stream.destroyed) stream.destroy(err || undefined);
+        if (err) reject(err);
+        else resolve(val);
+      };
 
       const req = https.request({
         hostname: 'photoslibrary.googleapis.com',
         path:     '/v1/uploads',
         method:   'POST',
+        timeout:  timeoutMs,
         headers: {
           'Authorization':              `Bearer ${accessToken}`,
           'Content-Type':               'application/octet-stream',
-          'Content-Length':             total,
+          'Content-Length':             fileSize,
           'X-Goog-Upload-Content-Type': mimeType,
           'X-Goog-Upload-Protocol':     'raw',
           'X-Goog-Upload-File-Name':    encodeURIComponent(filename),
@@ -156,50 +177,51 @@ class GooglePhotosClient {
         res.on('end', () => {
           process.stdout.write('\n');
           if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(body.trim());
+            done(null, body.trim());
           } else {
-            reject(new Error(`Upload failed with status ${res.statusCode}: ${body}`));
+            done(new Error(`Upload failed with status ${res.statusCode}: ${body}`));
           }
         });
+        res.on('error', (err) => { process.stdout.write('\n'); done(err); });
       });
 
-      req.on('error', (err) => {
-        process.stdout.write('\n');
-        reject(err);
+      req.on('timeout', () => {
+        req.destroy();
+        done(new Error(`Upload timed out after ${Math.round(timeoutMs / 60000)} minutes`));
       });
 
-      // Write buffer in 256KB chunks — update progress bar after each chunk
-      const writeChunk = (offset) => {
-        if (offset >= total) {
-          req.end();
-          return;
-        }
-        const chunk = buffer.slice(offset, Math.min(offset + UPLOAD_CHUNK, total));
+      // Upload req error → destroy stream + reject
+      req.on('error', (err) => { process.stdout.write('\n'); done(err); });
+
+      // Stream download → upload with backpressure
+      stream.on('data', (chunk) => {
         const ok = req.write(chunk);
         sent += chunk.length;
 
-        const pct     = Math.round((sent / total) * 100);
-        const doneMB  = (sent  / 1024 / 1024).toFixed(1);
-        const totalMB = (total / 1024 / 1024).toFixed(1);
-        const filled  = Math.floor(pct / 5);
-        const bar     = '█'.repeat(filled) + '░'.repeat(20 - filled);
+        const pct    = Math.round((sent / fileSize) * 100);
+        const doneMB = (sent / 1024 / 1024).toFixed(1);
+        const filled = Math.floor(pct / 5);
+        const bar    = '█'.repeat(filled) + '░'.repeat(20 - filled);
         process.stdout.write(`\r  Uploading:   [${bar}] ${pct}% — ${doneMB}MB / ${totalMB}MB`);
 
-        // Respect backpressure — wait for drain if write buffer is full
-        if (ok) {
-          setImmediate(() => writeChunk(offset + UPLOAD_CHUNK));
-        } else {
-          req.once('drain', () => writeChunk(offset + UPLOAD_CHUNK));
-        }
-      };
+        // If upload socket buffer full, pause CDN download until drained
+        if (!ok) stream.pause();
+      });
 
-      writeChunk(0);
+      // Upload drained → resume CDN download
+      req.on('drain', () => { if (!stream.destroyed) stream.resume(); });
+
+      // Download finished → close upload request
+      stream.on('end', () => req.end());
+
+      // Download stream error → abort upload + reject
+      stream.on('error', (err) => { process.stdout.write('\n'); req.destroy(); done(err); });
     });
 
     if (!uploadToken) throw new Error('Google Photos returned empty upload token');
     logger.debug(`Google Photos → got upload token for "${filename}"`);
 
-    // Step 2: Create media item in library and add to album
+    // Step 2: Create media item and add to album
     const albumId = await this.getOrCreateAlbum();
 
     const createRes = await axios.post(
@@ -224,7 +246,7 @@ class GooglePhotosClient {
     const photoId = result?.mediaItem?.id;
     if (!photoId) throw new Error('Google Photos did not return a media item ID');
 
-    // Persist photoId immediately via callback — crash-safe
+    // Persist photoId immediately — crash-safe checkpoint
     if (onPhotoIdReceived) onPhotoIdReceived(photoId);
 
     logger.debug(`Google Photos → uploaded to album "${ALBUM_NAME}", id: ${photoId}`);
