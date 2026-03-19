@@ -1,21 +1,23 @@
 const axios = require('axios');
+const https = require('https');
+const { PassThrough } = require('stream');
 const { PublicClientApplication } = require('@azure/msal-node');
 const fs = require('fs');
 const path = require('path');
 const { logger } = require('./logger');
 
 const TOKEN_CACHE = path.join(__dirname, '.onedrive_token.json');
+
 const IMAGE_EXTENSIONS = new Set([
-  // Common photos
+  // Photos
   '.jpg', '.jpeg', '.png', '.gif', '.webp',
   '.heic', '.heif', '.bmp', '.tiff', '.tif',
   '.raw', '.arw', '.cr2', '.cr3', '.nef',   // RAW (Sony, Canon, Nikon)
   '.dng', '.orf', '.rw2', '.pef',            // RAW (Adobe, Olympus, Panasonic, Pentax)
   '.svg',
- 
   // Videos
   '.mp4', '.mov', '.avi', '.mkv', '.3gp',
-  '.m4v', '.wmv', '.flv', '.webm', '.mts',  // MTS = Sony/Panasonic cameras
+  '.m4v', '.wmv', '.flv', '.webm', '.mts',
   '.m2ts', '.mpg', '.mpeg',
 ]);
 
@@ -49,7 +51,6 @@ class OneDriveClient {
   async authenticate() {
     const scopes = ['Files.Read', 'offline_access'];
 
-    // Try silent first (cached token)
     try {
       const accounts = await this.msalClient.getTokenCache().getAllAccounts();
       if (accounts.length > 0) {
@@ -59,21 +60,16 @@ class OneDriveClient {
         return;
       }
     } catch (err) {
-      // Stale/invalid cache — wipe it and fall through to device code flow
       logger.debug(`OneDrive → silent auth failed (${err.errorCode || err.message}), clearing cache`);
       if (fs.existsSync(TOKEN_CACHE)) fs.unlinkSync(TOKEN_CACHE);
     }
 
-    // Device code flow — MSAL returns different field names depending on version
-    // so we check all known variants to be safe
     const result = await this.msalClient.acquireTokenByDeviceCode({
       scopes,
       deviceCodeCallback: async (response) => {
         logger.section('OneDrive Authentication Required');
-
         const url  = response.verificationUri || response.verification_uri || response.verificationUrl;
         const code = response.userCode || response.user_code;
-
         if (url && code) {
           logger.info(`Code   : ${code}`);
           logger.info('Opening browser for sign-in...');
@@ -82,10 +78,10 @@ class OneDriveClient {
             await open(url);
             logger.info(`If browser does not open, visit:\n  ${url}\n  and enter the code: ${code}`);
           } catch {
-            logger.info(`If browser does not open, visit:\n  ${url}\n  and enter the code: ${code}`);
+            logger.info(`Visit:\n  ${url}\n  and enter the code: ${code}`);
           }
         } else {
-          logger.info(response.message || 'Check MSAL output for sign-in instructions');
+          logger.info(response.message || 'Check terminal for sign-in instructions');
         }
         logger.info('Waiting for sign-in... (you have ~15 minutes)');
       },
@@ -98,7 +94,6 @@ class OneDriveClient {
   // ── Scan all files (paginated) ────────────────────────────────
 
   async *scanAllFiles() {
-    // Use delta API — lists ALL files across all folders recursively, no empty query needed
     let url =
       `https://graph.microsoft.com/v1.0/me/drive/root/delta`
       + `?$select=id,name,size,lastModifiedDateTime,file,parentReference`
@@ -113,7 +108,6 @@ class OneDriveClient {
       const response = await this._get(url);
       const items = response.value || [];
 
-      // Filter to media files only (skip folders and non-media)
       const media = items.filter((f) => {
         if (!f.file) return false;
         const dot = f.name.lastIndexOf('.');
@@ -123,21 +117,18 @@ class OneDriveClient {
       });
 
       logger.debug(`  Page ${pageNum}: ${items.length} items fetched, ${media.length} are media`);
-
       if (media.length > 0) yield media;
 
-      // nextLink = more pages to fetch, deltaLink = done
       url = response['@odata.nextLink'] || null;
     }
 
     logger.debug(`OneDrive → scan complete, ${pageNum} pages fetched`);
   }
 
+  // ── Resolve download URL (follow redirects, return final CDN URL) ──
 
-  // ── Download a single file into memory ───────────────────────
-
-  async downloadFile(onedriveId, filename) {
-    logger.debug(`OneDrive → downloading "${filename}" (id: ${onedriveId})`);
+  async getDownloadStream(onedriveId, filename, fileSize) {
+    logger.debug(`OneDrive → resolving download URL for "${filename}"`);
 
     const meta = await this._get(
       `https://graph.microsoft.com/v1.0/me/drive/items/${onedriveId}`
@@ -147,34 +138,10 @@ class OneDriveClient {
     const downloadUrl = meta['@microsoft.graph.downloadUrl'];
     if (!downloadUrl) throw new Error('No download URL returned from OneDrive');
 
-    // Use https directly — axios onDownloadProgress fires too infrequently
-    const buffer = await new Promise((resolve, reject) => {
-      const https  = require('https');
-      const urlObj = new URL(downloadUrl);
+    const finalUrl = await resolveRedirect(downloadUrl);
+    logger.debug(`OneDrive → resolved CDN URL for "${filename}"`);
 
-      const doRequest = (reqUrl) => {
-        const r = https.request({
-          hostname: reqUrl.hostname,
-          path:     reqUrl.pathname + reqUrl.search,
-          method:   'GET',
-          timeout:  120_000,
-        }, (res) => {
-          // Follow redirect (OneDrive URLs redirect to CDN)
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            doRequest(new URL(res.headers.location));
-            return;
-          }
-          collectResponse(res, resolve, reject);
-        });
-        r.on('error', (err) => { process.stdout.write('\n'); reject(err); });
-        r.end();
-      };
-
-      doRequest(urlObj);
-    });
-
-    logger.debug(`OneDrive → downloaded "${filename}" (${(buffer.length / 1024).toFixed(0)} KB)`);
-    return buffer;
+    return { finalUrl, fileSize };
   }
 
   // ── Internal helpers ──────────────────────────────────────────
@@ -195,34 +162,104 @@ class OneDriveClient {
   }
 }
 
-// Collects streamed response into a Buffer with progress bar
-function collectResponse(res, resolve, reject) {
-  const total = parseInt(res.headers['content-length'] || '0', 10);
-  const chunks = [];
-  let received = 0;
+// ── resolveRedirect ───────────────────────────────────────────
+// Follows redirects via HEAD requests and returns the final URL.
+// OneDrive pre-auth URLs redirect to a CDN — we resolve upfront
+// so the actual data stream goes directly to the CDN, not through
+// an extra redirect hop.
 
-  res.on('data', (chunk) => {
-    chunks.push(chunk);
-    received += chunk.length;
-    if (total) {
-      const pct     = Math.round((received / total) * 100);
-      const doneMB  = (received / 1024 / 1024).toFixed(1);
-      const totalMB = (total    / 1024 / 1024).toFixed(1);
-      const filled  = Math.floor(pct / 5);
-      const bar     = '█'.repeat(filled) + '░'.repeat(20 - filled);
-      process.stdout.write(`\r  Downloading: [${bar}] ${pct}% — ${doneMB}MB / ${totalMB}MB`);
-    }
-  });
-
-  res.on('end', () => {
-    process.stdout.write('\n');
-    resolve(Buffer.concat(chunks));
-  });
-
-  res.on('error', (err) => {
-    process.stdout.write('\n');
-    reject(err);
+function resolveRedirect(url, maxRedirects = 5) {
+  return new Promise((resolve, reject) => {
+    const attempt = (reqUrl, remaining) => {
+      const urlObj = new URL(reqUrl);
+      const r = https.request({
+        hostname: urlObj.hostname,
+        path:     urlObj.pathname + urlObj.search,
+        method:   'HEAD',
+        timeout:  15_000,
+      }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          if (remaining <= 0) return reject(new Error('Too many redirects resolving download URL'));
+          attempt(res.headers.location, remaining - 1);
+        } else {
+          resolve(reqUrl);
+        }
+      });
+      r.on('timeout', () => { r.destroy(); reject(new Error('Timeout resolving download URL')); });
+      r.on('error', reject);
+      r.end();
+    };
+    attempt(url, maxRedirects);
   });
 }
 
-module.exports = { OneDriveClient };
+// ── createDownloadStream ──────────────────────────────────────
+// Opens a streaming GET to the final CDN URL.
+// Returns a PassThrough stream — data flows chunk by chunk, never
+// accumulates in RAM. The caller is responsible for destroying
+// the stream on error (call stream.destroy(err)).
+
+function createDownloadStream(finalUrl, fileSize) {
+  const pass = new PassThrough();
+  const urlObj = new URL(finalUrl);
+  let received = 0;
+  const total = fileSize || 0;
+
+  // Timeout scales with file size: minimum 2 min, +1s per MB, max 6 hours
+  const timeoutMs = Math.min(
+    Math.max(120_000, (total / 1024 / 1024) * 1000),
+    6 * 60 * 60 * 1000
+  );
+
+  const r = https.request({
+    hostname: urlObj.hostname,
+    path:     urlObj.pathname + urlObj.search,
+    method:   'GET',
+    timeout:  timeoutMs,
+  }, (res) => {
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      pass.destroy(new Error(`Download failed with HTTP ${res.statusCode}`));
+      return;
+    }
+
+    res.on('data', (chunk) => {
+      received += chunk.length;
+      if (total) {
+        const pct     = Math.round((received / total) * 100);
+        const doneMB  = (received / 1024 / 1024).toFixed(1);
+        const totalMB = (total    / 1024 / 1024).toFixed(1);
+        const filled  = Math.floor(pct / 5);
+        const bar     = '█'.repeat(filled) + '░'.repeat(20 - filled);
+        process.stdout.write(`\r  Downloading: [${bar}] ${pct}% — ${doneMB}MB / ${totalMB}MB`);
+      }
+
+      // Respect PassThrough backpressure — pause CDN if upload can't keep up
+      const ok = pass.write(chunk);
+      if (!ok) res.pause();
+    });
+
+    // Resume CDN download when downstream (upload) drains
+    pass.on('drain', () => res.resume());
+
+    res.on('end',   ()    => { process.stdout.write('\n'); pass.end(); });
+    res.on('error', (err) => { process.stdout.write('\n'); pass.destroy(err); });
+  });
+
+  r.on('timeout', () => {
+    r.destroy();
+    pass.destroy(new Error(`Download timed out after ${Math.round(timeoutMs / 60000)} minutes`));
+  });
+
+  // When the stream is destroyed externally (e.g. upload failed),
+  // abort the underlying HTTP request immediately to free the connection
+  pass.on('close', () => {
+    if (!r.destroyed) r.destroy();
+  });
+
+  r.on('error', (err) => { process.stdout.write('\n'); pass.destroy(err); });
+  r.end();
+
+  return pass;
+}
+
+module.exports = { OneDriveClient, createDownloadStream };
