@@ -1,14 +1,16 @@
 require('dotenv').config();
 
-const { OneDriveClient } = require('./onedrive');
+const { OneDriveClient, createDownloadStream } = require('./onedrive');
 const { GooglePhotosClient } = require('./google-photos');
 const { Database } = require('./db');
 const { logger } = require('./logger');
 
 // ── Config ────────────────────────────────────────────────────
-const BATCH_SIZE = 5;      // files processed concurrently
-const MAX_RETRIES = 3;     // skip a file after this many failures
-const MAX_FILE_SIZE_MB = process.env.MAX_FILE_SIZE_MB ? parseInt(process.env.MAX_FILE_SIZE_MB) : null; // null = no limit
+const BATCH_SIZE       = 5;
+const MAX_RETRIES      = 3;
+const MAX_FILE_SIZE_MB = process.env.MAX_FILE_SIZE_MB
+  ? parseInt(process.env.MAX_FILE_SIZE_MB)
+  : null; // null = no limit
 
 // ── Entry point ───────────────────────────────────────────────
 async function main() {
@@ -21,33 +23,26 @@ async function main() {
   logger.section('OneDrive → Google Photos Migration');
   logger.info('Starting up...');
 
-  // Init DB
   const db = new Database();
   await db.init();
 
-  // Reset any files stuck mid-transfer from a previous crash
   db.resetStuckFiles();
 
-  // Init API clients
   const onedrive = new OneDriveClient();
-  const gphotos = new GooglePhotosClient();
+  const gphotos  = new GooglePhotosClient();
 
-  // Authenticate both services
   logger.section('Authentication');
   await onedrive.authenticate();
   await gphotos.authenticate();
 
-  // Decide: fresh scan needed, or resume?
-  const totalInDb = db.getTotalCount();
+  const totalInDb    = db.getTotalCount();
   const pendingCount = db.getPendingCount();
 
   if (totalInDb === 0) {
-    // ── Fresh migration ──────────────────────────────────────
     logger.section('Phase 1 — Scanning OneDrive');
     logger.info('No files in DB yet. Scanning OneDrive for all images and videos...');
     await scanOneDrive(onedrive, db);
   } else {
-    // ── Resume or retry ──────────────────────────────────────
     logger.section('Phase 1 — Scan Skipped (Resuming)');
     logger.info(`Found ${totalInDb} files already in DB`);
     logger.info(`${pendingCount} files pending/failed → will upload those`);
@@ -59,11 +54,9 @@ async function main() {
     }
   }
 
-  // ── Upload phase ─────────────────────────────────────────────
   logger.section('Phase 2 — Uploading to Google Photos');
   await uploadAll(onedrive, gphotos, db);
 
-  // ── Final summary ─────────────────────────────────────────────
   logger.section('Migration Complete');
   const stats = db.getStats();
   logger.summary(stats);
@@ -74,11 +67,11 @@ async function main() {
   }
 }
 
-// ── Scan all OneDrive files and insert into DB ────────────────
+// ── Scan ──────────────────────────────────────────────────────
 
 async function scanOneDrive(onedrive, db) {
   let totalFound = 0;
-  let pageNum = 0;
+  let pageNum    = 0;
 
   for await (const batch of onedrive.scanAllFiles()) {
     pageNum++;
@@ -99,7 +92,7 @@ async function scanOneDrive(onedrive, db) {
   logger.success(`Scan complete — ${totalFound} images/videos queued for upload`);
 }
 
-// ── Upload all pending/failed files ──────────────────────────
+// ── Upload ────────────────────────────────────────────────────
 
 async function uploadAll(onedrive, gphotos, db) {
   let uploaded = 0;
@@ -111,14 +104,14 @@ async function uploadAll(onedrive, gphotos, db) {
     if (batch.length === 0) break;
 
     for (const file of batch) {
-      // Skip files that have failed too many times
+      // Skip files that have permanently failed too many times
       if (file.retry_count >= MAX_RETRIES) {
-        logger.warn(`Skipping "${file.name}" — failed ${file.retry_count} times already`);
+        logger.warn(`Skipping "${file.name}" — failed ${file.retry_count} times, exceeded MAX_RETRIES`);
         skipped++;
         continue;
       }
 
-      // Skip files exceeding size limit if MAX_FILE_SIZE_MB is set
+      // Skip files exceeding size limit (if set)
       if (MAX_FILE_SIZE_MB && file.size && file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
         logger.warn(`Skipping "${file.name}" (${formatSize(file.size)}) — exceeds MAX_FILE_SIZE_MB limit of ${MAX_FILE_SIZE_MB}MB`);
         skipped++;
@@ -127,48 +120,63 @@ async function uploadAll(onedrive, gphotos, db) {
 
       logger.info(`Processing: "${file.name}" (${formatSize(file.size)}) [retry: ${file.retry_count}]`);
 
-      let buffer = null;
+      // ── Stream: OneDrive → Google Photos ─────────────────────
+      // Bytes flow chunk by chunk (~256KB at a time).
+      // The full file is never held in RAM — safe for files of any size.
+      let stream = null;
 
-      // ── Step 1: Download from OneDrive ──────────────────────
       try {
         db.markDownloading(file.id);
-        logger.debug(`  → Downloading from OneDrive...`);
-        buffer = await onedrive.downloadFile(file.onedrive_id, file.name);
-        logger.debug(`  → Download complete (${formatSize(buffer.length)})`);
-      } catch (err) {
-        const msg = `Download failed: ${err.message}`;
-        logger.error(`  ✗ ${file.name} — ${msg}`);
-        db.markFailed(file.id, 'download', msg);
-        failed++;
-        continue;
-      }
+        logger.debug(`  → Resolving download URL...`);
 
-      // ── Step 2: Upload to Google Photos ────────────────────
-      try {
+        const { finalUrl, fileSize } = await onedrive.getDownloadStream(
+          file.onedrive_id, file.name, file.size
+        );
+
+        // Open stream — data starts flowing immediately
+        stream = createDownloadStream(finalUrl, fileSize);
+
         db.markUploading(file.id);
-        logger.debug(`  → Uploading to Google Photos...`);
-        // onPhotoIdReceived is called inside uploadPhoto the moment Google confirms
-        // the photo ID — before uploadPhoto even returns. This means even if the
-        // process crashes on the next line, the ID is already in the DB and
-        // resetStuckFiles() will recover it to 'done' without re-uploading.
+        logger.debug(`  → Streaming to Google Photos...`);
+
+        // onPhotoIdReceived is called the moment Google confirms the photo ID,
+        // before uploadPhoto returns — crash-safe checkpoint in DB
         const photoId = await gphotos.uploadPhoto(
-          buffer, file.name, file.mime_type, file.modified_date,
+          stream,
+          file.name,
+          file.mime_type,
+          fileSize,
+          file.modified_date,
           (id) => db.markUploaded(file.id, id)
         );
-        buffer = null; // free memory immediately
+
+        // stream is destroyed inside uploadPhoto on success — no cleanup needed here
+        stream = null;
+
         db.markDone(file.id, photoId);
         logger.success(`  ✓ Uploaded: "${file.name}" → Google Photos ID: ${photoId}`);
         uploaded++;
+
       } catch (err) {
-        buffer = null; // free memory
-        const msg = `Upload failed: ${err.message}`;
+        // Ensure stream is always destroyed on any error —
+        // this aborts the OneDrive CDN connection and frees the socket
+        if (stream && !stream.destroyed) {
+          stream.destroy();
+          stream = null;
+        }
+
+        // Classify error stage for accurate DB logging
+        const isDownloadErr = err.message.includes('Download') || err.message.includes('timed out');
+        const stage = isDownloadErr ? 'download' : 'upload';
+        const msg   = `${stage === 'download' ? 'Download' : 'Upload'} failed: ${err.message}`;
+
         logger.error(`  ✗ ${file.name} — ${msg}`);
-        db.markFailed(file.id, 'upload', msg);
+        db.markFailed(file.id, stage, msg);
         failed++;
       }
 
       // Progress snapshot every 10 files
-      if ((uploaded + failed) % 10 === 0) {
+      if ((uploaded + failed) % 10 === 0 && (uploaded + failed) > 0) {
         const stats = db.getStats();
         logger.info(`── Progress: ${stats.done} done | ${stats.failed} failed | ${stats.pending} remaining ──`);
       }
@@ -201,9 +209,10 @@ async function showStatus() {
 
 function formatSize(bytes) {
   if (!bytes) return '?';
-  if (bytes < 1024)        return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes < 1024)             return `${bytes} B`;
+  if (bytes < 1024 * 1024)      return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 main().catch((err) => {
