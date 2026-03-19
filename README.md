@@ -174,4 +174,4 @@ MIT © [Ankit Kumar](https://github.com/ankitsny)
 
 ## Credits
 
-Built with the help of [Claude](https://claude.ai) by Anthropic 🤖
+Built with the help of [Claude](https://claude.ai) by Anthropic from code to debugging every 403 along the way. 🤖
