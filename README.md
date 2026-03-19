@@ -29,7 +29,7 @@ cp .env.example .env       # fill in your credentials
 node migrate.js            # start migrating
 ```
 
-See [credentials.md](./credentials.md) for step-by-step credential setup.
+See [credentials.md](./CREDENTIALS.md) for step-by-step credential setup.
 
 ---
 
@@ -55,7 +55,7 @@ cp .env.example .env
 | `ONEDRIVE_CLIENT_ID` | ✅ | Azure app client ID |
 | `GOOGLE_CLIENT_ID` | ✅ | Google OAuth client ID |
 | `GOOGLE_CLIENT_SECRET` | ✅ | Google OAuth client secret |
-| `GOOGLE_ALBUM_NAME` | optional | Album name in Google Photos (default: `From OneDrive`) |
+| `GOOGLE_ALBUM_NAME` | optional | Album name in Google Photos (default: `"From OneDrive"`) |
 | `MAX_FILE_SIZE_MB` | optional | Skip files larger than this in MB (default: no limit) |
 
 ---
@@ -169,3 +169,9 @@ Everything is also written to `migration.log` for later review.
 ## License
 
 MIT © [Ankit Kumar](https://github.com/ankitsny)
+
+---
+
+## Credits
+
+Built with the help of [Claude](https://claude.ai) by Anthropic 🤖
