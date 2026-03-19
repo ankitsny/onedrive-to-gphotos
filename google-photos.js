@@ -129,7 +129,7 @@ class GooglePhotosClient {
   // onPhotoIdReceived — called immediately when Google confirms the ID,
   //                     before this function returns, for crash-safe DB write
 
-  async uploadPhoto(stream, filename, mimeType, fileSize, modifiedDate, onPhotoIdReceived = null) {
+  async uploadPhoto(stream, filename, mimeType, fileSize, modifiedDate, onPhotoIdReceived = null, progressState = null) {
     const accessToken = (await this.oauth2Client.getAccessToken()).token;
     const totalMB = (fileSize / 1024 / 1024).toFixed(1);
 
@@ -175,14 +175,15 @@ class GooglePhotosClient {
         let body = '';
         res.on('data', (d) => body += d);
         res.on('end', () => {
-          process.stdout.write('\n');
+          if (progressState) progressState.finish();
+          else process.stdout.write('\n');
           if (res.statusCode >= 200 && res.statusCode < 300) {
             done(null, body.trim());
           } else {
             done(new Error(`Upload failed with status ${res.statusCode}: ${body}`));
           }
         });
-        res.on('error', (err) => { process.stdout.write('\n'); done(err); });
+        res.on('error', (err) => { if (progressState) progressState.finish(); else process.stdout.write('\n'); done(err); });
       });
 
       req.on('timeout', () => {
@@ -191,18 +192,18 @@ class GooglePhotosClient {
       });
 
       // Upload req error → destroy stream + reject
-      req.on('error', (err) => { process.stdout.write('\n'); done(err); });
+      req.on('error', (err) => { if (progressState) progressState.finish(); else process.stdout.write('\n'); done(err); });
 
       // Stream download → upload with backpressure
       stream.on('data', (chunk) => {
         const ok = req.write(chunk);
         sent += chunk.length;
 
-        const pct    = Math.round((sent / fileSize) * 100);
-        const doneMB = (sent / 1024 / 1024).toFixed(1);
-        const filled = Math.floor(pct / 5);
-        const bar    = '█'.repeat(filled) + '░'.repeat(20 - filled);
-        process.stdout.write(`\r  Uploading:   [${bar}] ${pct}% — ${doneMB}MB / ${totalMB}MB`);
+        if (progressState) {
+          progressState.ulPct = Math.round((sent / fileSize) * 100);
+          progressState.ulMB  = (sent / 1024 / 1024).toFixed(1);
+          progressState.render();
+        }
 
         // If upload socket buffer full, pause CDN download until drained
         if (!ok) stream.pause();
@@ -215,7 +216,7 @@ class GooglePhotosClient {
       stream.on('end', () => req.end());
 
       // Download stream error → abort upload + reject
-      stream.on('error', (err) => { process.stdout.write('\n'); req.destroy(); done(err); });
+      stream.on('error', (err) => { if (progressState) progressState.finish(); else process.stdout.write('\n'); req.destroy(); done(err); });
     });
 
     if (!uploadToken) throw new Error('Google Photos returned empty upload token');
